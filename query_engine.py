@@ -1,107 +1,90 @@
-# query_engine.py
+"""Command-line question answering over the indexed SEC filings.
 
-from vector_store import SECVectorStore
-from transformers import pipeline
-from langchain_core.prompts import PromptTemplate
-
-
-vector_store = SECVectorStore()
-
-qa_model = pipeline(
-    "text2text-generation",
-    model="google/flan-t5-base",
-    max_new_tokens=256
-)
-
-summary_model = pipeline(
-    "summarization",
-    model="google/flan-t5-base",
-    max_length=120,
-    min_length=40
-)
-
-PROMPT = PromptTemplate(
-    input_variables=["context", "question"],
-    template="""
-Answer STRICTLY using the context below.
-If the answer is not present, say "Not found in the filing."
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
+Interactive:   python query_engine.py
+One question:  python query_engine.py -c AAPL -f 10-K -y 2024 -q "What were total net sales?"
 """
-)
+import argparse
+import sys
+from typing import Optional
+
+from errors import SECProjectError
+from rag_chain import STATUS_LABELS, AskResult, SECRAGChain
 
 
-def calculate_claim_percentage(answer: str):
-    if "not found" in answer.lower():
-        return "0% (Not satisfied)"
-    if len(answer.split()) < 25:
-        return "50% (Partially satisfied)"
-    return "90% (Satisfied)"
-
-
-def ask_question(company, form_type, year, question):
-    # 🔑 Chroma filters (ONLY supported keys)
-    filters = {
-        "company": company,
-        "form_type": form_type
-    }
-
-    docs = vector_store.retrieve(question, k=5, filters=filters)
-
-    # 🔑 YEAR filtering done safely in Python
-    docs = [
-        d for d in docs
-        if d.metadata.get("filed_at", "").startswith(year)
+def format_result(result: AskResult) -> str:
+    lines = [
+        "",
+        "ANSWER:",
+        result.answer,
+        "",
+        "SUMMARY:",
+        result.summary or "(none)",
+        "",
+        "EVIDENCE CHECK:",
     ]
+    if result.evidence:
+        for item in result.evidence:
+            mark = "verified" if item.verified else "NOT FOUND in filing"
+            src = f"S{item.source_id}" if item.source_id else "S?"
+            lines.append(f'  [{mark}] ({src}) "{item.quote}"')
+    else:
+        lines.append("  (no quotes to check)")
+    lines += ["", "SOURCES USED:"]
+    for s in result.sources:
+        lines.append(f"  [S{s.id}] {s.company} {s.form_type} {s.year} (filed {s.filed_at}) - {s.url}")
+    lines += [
+        "",
+        f"CLAIM PERCENTAGE: {result.claim_percentage}% ({STATUS_LABELS[result.status]})"
+        " - share of quoted evidence found word for word in the filing text",
+    ]
+    if result.note:
+        lines.append(f"NOTE: {result.note}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
 
-    if not docs:
-        print("❌ No matching filing found.")
-        return
 
-    context = ""
-    sources = set()
+def ask_question(company: Optional[str], form_type: Optional[str], year: Optional[str],
+                 question: str, chain: Optional[SECRAGChain] = None) -> AskResult:
+    """Ask one question and return the result (printing is done by the caller)."""
+    chain = chain or SECRAGChain()
+    return chain.ask(question, company=company, form_type=form_type, year=year)
 
-    for i, doc in enumerate(docs, 1):
-        context += f"\n[Source {i}]\n{doc.page_content}\n"
-        if "url" in doc.metadata:
-            sources.add(doc.metadata["url"])
 
-    prompt = PROMPT.format(
-        context=context[:1500],
-        question=question
-    )
+def _interactive(chain: SECRAGChain) -> int:
+    print("SEC Filing Q&A ready. Leave company / form / year empty to search every indexed filing.\n")
+    while True:
+        company = input("Company ticker or name (or 'exit'): ").strip()
+        if company.lower() == "exit":
+            return 0
+        form_type = input("Form type (10-K / 10-Q, optional): ").strip()
+        year = input("Fiscal year YYYY (optional): ").strip()
+        question = input("Question: ").strip()
+        try:
+            print(format_result(ask_question(company, form_type, year, question, chain)))
+        except SECProjectError as exc:
+            print(f"\nCould not answer: {exc}\n")
+        except ValueError as exc:
+            print(f"\n{exc}\n")
 
-    answer = qa_model(prompt)[0]["generated_text"]
-    summary = summary_model(context[:1000])[0]["summary_text"]
-    claim = calculate_claim_percentage(answer)
 
-    print("\n✅ VERIFIED ANSWER:\n", answer)
-    print("\n📝 SUMMARY:\n", summary)
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Ask questions about indexed SEC filings.")
+    parser.add_argument("-c", "--company", default="", help="ticker or company name")
+    parser.add_argument("-f", "--form", default="", help="10-K or 10-Q")
+    parser.add_argument("-y", "--year", default="", help="fiscal year, e.g. 2024")
+    parser.add_argument("-q", "--question", default="", help="question (omit for interactive mode)")
+    args = parser.parse_args(argv)
 
-    print("\n📌 SOURCE URL(S):")
-    for src in sources:
-        print("-", src)
-
-    print("\n📊 CLAIM PERCENTAGE:", claim)
-    print("-" * 60)
+    chain = SECRAGChain()
+    if not args.question:
+        return _interactive(chain)
+    try:
+        print(format_result(ask_question(args.company, args.form, args.year, args.question, chain)))
+        return 0
+    except (SECProjectError, ValueError) as exc:
+        print(f"Could not answer: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    print("SEC Filing RAG System Ready\n")
-
-    while True:
-        company = input("Company (or exit): ")
-        if company.lower() == "exit":
-            break
-
-        form_type = input("Form Type : ")
-        year = input("Year (YYYY): ")
-        question = input("Question: ")
-
-        ask_question(company, form_type, year, question)
+    sys.exit(main())
